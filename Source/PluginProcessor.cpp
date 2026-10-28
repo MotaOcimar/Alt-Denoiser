@@ -184,11 +184,19 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     attenLim.store(*apvts.getRawParameterValue("atten_lim"));
 
     // if stereo input, downmix to channel 0 for mono denoiser processing
+    // (a mono source on a stereo bus leaves one channel silent: use the other one as is,
+    //  since averaging would drop the level by 6 dB)
     if (totalNumInputChannels > 1) {
         auto* ch0 = buffer.getWritePointer(0);
         const auto* ch1 = buffer.getReadPointer(1);
-        for (int i = 0; i < hostNumSamples; ++i) {
-            ch0[i] = 0.5f * (ch0[i] + ch1[i]);
+        const bool ch0Silent = buffer.getMagnitude(0, 0, hostNumSamples) == 0.0f;
+        const bool ch1Silent = buffer.getMagnitude(1, 0, hostNumSamples) == 0.0f;
+        if (ch0Silent) {
+            buffer.copyFrom(0, 0, buffer, 1, 0, hostNumSamples);
+        } else if (!ch1Silent) {
+            for (int i = 0; i < hostNumSamples; ++i) {
+                ch0[i] = 0.5f * (ch0[i] + ch1[i]);
+            }
         }
     }
 
