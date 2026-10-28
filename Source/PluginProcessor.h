@@ -5,61 +5,48 @@
 #include "Resampler.hpp"
 #include <vector>
 #include <memory>
+#include <atomic>
+#include <thread>
 
-class SimpleFifo {
+// Single-producer / single-consumer ring buffer, lock-free (juce::AbstractFifo)
+class SpscFifo {
 public:
-    void setSize(int size) { 
-        buffer.assign(size, 0.0f); 
-        writePos = 0; readPos = 0; samplesInFifo = 0; 
+    // not thread-safe: call only while the worker thread is stopped
+    void setSize(int size) {
+        buffer.assign(size, 0.0f);
+        fifo.setTotalSize(size);
     }
 
     void clear() {
-        std::fill(buffer.begin(), buffer.end(), 0.0f);
-        writePos = 0; readPos = 0; samplesInFifo = 0;
-    }
-    
-    void push(const float* data, int numSamples) {
-        if (buffer.empty() || numSamples <= 0) return;
-        for (int i = 0; i < numSamples; ++i) {
-            buffer[writePos] = data[i];
-            writePos = (writePos + 1) % buffer.size();
-        }
-        samplesInFifo += numSamples;
-        if (samplesInFifo > (int)buffer.size()) samplesInFifo = (int)buffer.size();
+        fifo.reset();
     }
 
-    void pushSilence(int numSamples) {
-        if (buffer.empty() || numSamples <= 0) return;
-        for (int i = 0; i < numSamples; ++i) {
-            buffer[writePos] = 0.0f;
-            writePos = (writePos + 1) % buffer.size();
-        }
-        samplesInFifo += numSamples;
-        if (samplesInFifo > (int)buffer.size()) samplesInFifo = (int)buffer.size();
+    int push(const float* data, int numSamples) {
+        const auto scope = fifo.write(numSamples);
+        if (scope.blockSize1 > 0) std::copy(data, data + scope.blockSize1, buffer.data() + scope.startIndex1);
+        if (scope.blockSize2 > 0) std::copy(data + scope.blockSize1, data + scope.blockSize1 + scope.blockSize2, buffer.data() + scope.startIndex2);
+        return scope.blockSize1 + scope.blockSize2;
     }
-    
-    void peek(float* dest, int numSamples) {
-        if (buffer.empty() || numSamples <= 0) return;
-        int tempRead = readPos;
-        for (int i = 0; i < numSamples; ++i) {
-            dest[i] = buffer[tempRead];
-            tempRead = (tempRead + 1) % buffer.size();
-        }
+
+    int pushSilence(int numSamples) {
+        const auto scope = fifo.write(numSamples);
+        if (scope.blockSize1 > 0) std::fill_n(buffer.data() + scope.startIndex1, scope.blockSize1, 0.0f);
+        if (scope.blockSize2 > 0) std::fill_n(buffer.data() + scope.startIndex2, scope.blockSize2, 0.0f);
+        return scope.blockSize1 + scope.blockSize2;
     }
-    
-    void discard(int numSamples) {
-        if (buffer.empty() || numSamples <= 0) return;
-        readPos = (readPos + numSamples) % buffer.size();
-        samplesInFifo = std::max(0, samplesInFifo - numSamples);
+
+    int pop(float* dest, int numSamples) {
+        const auto scope = fifo.read(numSamples);
+        if (scope.blockSize1 > 0) std::copy_n(buffer.data() + scope.startIndex1, scope.blockSize1, dest);
+        if (scope.blockSize2 > 0) std::copy_n(buffer.data() + scope.startIndex2, scope.blockSize2, dest + scope.blockSize1);
+        return scope.blockSize1 + scope.blockSize2;
     }
-    
-    int getAvailable() const { return samplesInFifo; }
+
+    int getAvailable() const { return fifo.getNumReady(); }
 
 private:
     std::vector<float> buffer;
-    int writePos = 0;
-    int readPos = 0;
-    int samplesInFifo = 0;
+    juce::AbstractFifo fifo { 1 };
 };
 
 class AltDenoiserProcessor : public juce::AudioProcessor {
@@ -114,12 +101,26 @@ public:
 private:
     std::unique_ptr<DeepFilterNetProcessor> dfProcessor;
 
-    SimpleFifo inputFifo;
-    SimpleFifo outputFifo;
+    // inference runs on its own thread, so a slow frame uses the latency headroom
+    // instead of stalling the host's audio thread
+    void startWorker();
+    void stopWorker();
+    void workerLoop();
+
+    SpscFifo inputFifo;
+    SpscFifo outputFifo;
     std::vector<float> tempInputFrame;
     std::vector<float> tempOutputFrame;
     bool modelLoaded = false;
     float lastAttenLim = -1.0f;
+
+    std::thread worker;
+    std::atomic<bool> workerShouldStop { false };
+    juce::WaitableEvent inputReady;
+    juce::WaitableEvent framesDone;
+    std::atomic<float> attenLim { 100.0f };
+    juce::int64 samplesPushed = 0;               // audio thread only
+    std::atomic<juce::int64> framesProcessed { 0 };
 
     std::unique_ptr<Resampler<1, 1>> resamplerHandler;
     std::vector<float> resampleInBuffer;
